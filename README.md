@@ -1,20 +1,31 @@
-# Smart-Car-Interface
+# SmartCarInterface — Connected Car System
 
-Projekt realizowany w ramach przedmiotu TWwAIRII.
+System telemetrii, zdalnej diagnostyki OBD-II oraz kontroli peryferiów pojazdu typu Connected Car. Aplikacja udostępnia interfejs w stylu nowoczesnych systemów pokładowych smart car, umożliwiając bieżący podgląd parametrów silnika, poziomu paliwa, temperatur wewnątrz i na zewnątrz kabiny, sterowanie zamkiem centralnym oraz modułem dogrzewania postojowego i wentylacji.
 
-Aplikacja kliencka systemu telemetrii i zdalnego sterowania pojazdem Opel Corsa B.
+---
 
-## Wymagania wstępne
-* [Node.js](https://nodejs.org/) (wersja 18 LTS lub nowsza)
-* Menedżer pakietów `npm` lub `yarn`
-* *(Dla urządzeń mobilnych)*: Aplikacja **Expo Go** zainstalowana na smartfonie (dostępna w Google Play i App Store)
+## Użyte technologie
 
-## Instalacja projektu lokalnie
+* **Frontend:** React Native, Expo, TypeScript, React Native for Web (wsparcie Web, Android, iOS)
+* **Komunikacja w czasie rzeczywistym:** WebSockets
+* **Backend API & Generator IoT:** Node.js / Express (lub Python FastAPI)
+* **Baza danych:** PostgreSQL / SQLite
+* **Konteneryzacja & Monitoring:** Docker, Prometheus, Grafana
 
-1. Sklonuj repozytorium na dysk:
+---
+
+## Instrukcja uruchomienia
+
+### Wymagania wstępne
+* Środowisko **Node.js** (wersja >= 18.x LTS) oraz menedżer pakietów **npm**
+* *(Opcjonalnie dla urządzeń mobilnych)*: Aplikacja **Expo Go** (Android/iOS)
+
+### Instalacja i uruchomienie
+
+1. Sklonuj repozytorium:
    ```bash
-   git clone <URL_REPOZYTORIUM>
-   cd CorsaOS
+   git clone https://github.com/TWwAIRII/Smart-Car-Interface.git
+   cd SmartCarInterface
    ```
 
 2. Zainstaluj zależności:
@@ -22,15 +33,18 @@ Aplikacja kliencka systemu telemetrii i zdalnego sterowania pojazdem Opel Corsa 
    npm install
    ```
 
-## Uruchomienie aplikacji
+3. Uruchom serwer developerski:
+   ```bash
+   npx expo start
+   ```
 
-Uruchom lokalny serwer developerski Metro:
+### Dostępne platformy:
+* **Przeglądarka internetowa (PC):** Wciśnij klawisz `w` w oknie terminala lub wpisz bezpośrednio `npx expo start --web`.
+* **Smartfon (Android / iOS):** Zeskanuj kod QR wyświetlony w terminalu przy użyciu aplikacji **Expo Go** (urządzenie mobilne i komputer muszą być w tej samej sieci Wi-Fi).
 
-```bash
-npx expo start
-```
+---
 
-### Opcje podglądu:
-* **Przeglądarka WWW (PC/Desktop):** wciśnij klawisz `w` w terminalu lub przejdź pod adres `http://localhost:8081`.
-* **Smartfon (Android/iOS):** zeskanuj kod QR wyświetlony w terminalu za pomocą aplikacji **Expo Go** (telefon musi znajdować się w tej samej sieci Wi-Fi).
-* **Emulator Android:** wciśnij klawisz `a` w terminalu (wymaga skonfigurowanego Android Studio).
+## Dokumentacja
+
+Szczegółowy opis założeń projektowych, przypadki użycia oraz zakres funkcjonalny znajdują się w dedykowanym dokumencie:
+* [Pełna dokumentacja projektu](docs/topic-selection.md)
