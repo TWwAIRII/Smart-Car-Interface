@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import List
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -13,6 +14,8 @@ from app.models.entities import (
     ObdError,
 )
 from app.schemas.dto import (
+    VehicleCreateRequest,
+    VehicleUpdateRequest,
     TelemetryIngestRequest,
     ClimateUpdateRequest,
     ObdErrorCreateRequest,
@@ -31,9 +34,13 @@ from app.core.metrics import (
 class VehicleBusinessService:
     """
     Główna logika biznesowa systemu SmartCarInterface (Connected Car).
-    Odpowiada za przeliczanie zasięgu, reguły bezpieczeństwa Webasto,
-    diagnostykę OBD-II, ocenę stylu jazdy (Ecodriving) oraz generowanie alertów.
+    Odpowiada za operacje CRUD na pojazdach, przeliczanie zasięgu, reguły bezpieczeństwa Webasto,
+    diagnostykę OBD-II, ocenę stylu jazdy (Ecodriving) oraz zarządzanie powiadomieniami.
     """
+
+    @staticmethod
+    def list_vehicles(db: Session) -> List[Vehicle]:
+        return db.query(Vehicle).order_by(Vehicle.id.asc()).all()
 
     @staticmethod
     def get_vehicle_or_404(db: Session, vehicle_id: int) -> Vehicle:
@@ -41,29 +48,94 @@ class VehicleBusinessService:
         if not vehicle:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Pojazd o ID={vehicle_id} nie istnieje."
+                detail=f"Pojazd o ID={vehicle_id} nie istnieje.",
             )
         return vehicle
+
+    @classmethod
+    def create_vehicle(cls, db: Session, payload: VehicleCreateRequest) -> Vehicle:
+        existing_vin = db.query(Vehicle).filter(Vehicle.vin == payload.vin).first()
+        if existing_vin:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Pojazd o numerze VIN '{payload.vin}' już istnieje w systemie.",
+            )
+
+        vehicle = Vehicle(
+            vin=payload.vin,
+            make=payload.make,
+            model=payload.model,
+            year=payload.year,
+            is_locked=payload.is_locked,
+            fuel_tank_capacity_l=payload.fuel_tank_capacity_l,
+            base_avg_consumption=payload.base_avg_consumption,
+        )
+        db.add(vehicle)
+        db.flush()
+
+        # Domyślne ustawienia klimatyzacji/Webasto dla nowo utworzonego pojazdu
+        db.add(
+            ClimateSettings(
+                vehicle_id=vehicle.id,
+                target_temperature=21.0,
+                is_active=False,
+                webasto_active=False,
+                fan_speed=0,
+            )
+        )
+        db.commit()
+        db.refresh(vehicle)
+        return vehicle
+
+    @classmethod
+    def update_vehicle(
+        cls,
+        db: Session,
+        vehicle_id: int,
+        payload: VehicleUpdateRequest,
+    ) -> Vehicle:
+        vehicle = cls.get_vehicle_or_404(db, vehicle_id)
+
+        vin_conflict = (
+            db.query(Vehicle)
+            .filter(Vehicle.vin == payload.vin, Vehicle.id != vehicle_id)
+            .first()
+        )
+        if vin_conflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Numer VIN '{payload.vin}' jest już przypisany do innego pojazdu.",
+            )
+
+        vehicle.vin = payload.vin
+        vehicle.make = payload.make
+        vehicle.model = payload.model
+        vehicle.year = payload.year
+        vehicle.is_locked = payload.is_locked
+        vehicle.fuel_tank_capacity_l = payload.fuel_tank_capacity_l
+        vehicle.base_avg_consumption = payload.base_avg_consumption
+
+        db.commit()
+        db.refresh(vehicle)
+        return vehicle
+
+    @classmethod
+    def delete_vehicle(cls, db: Session, vehicle_id: int) -> None:
+        vehicle = cls.get_vehicle_or_404(db, vehicle_id)
+        db.delete(vehicle)
+        db.commit()
 
     @staticmethod
     def calculate_estimated_range_km(
         vehicle: Vehicle,
         fuel_level_pct: float,
         webasto_active: bool = False,
-        current_speed: int = 0
+        current_speed: int = 0,
     ) -> int:
-        """
-        Wylicza szacowany zasięg pojazdu w kilometrach na podstawie:
-        - pojemności baku (domyślnie 46L dla Opla Corsy B),
-        - procentowego poziomu paliwa,
-        - bazowego średniego spalania skorygowanego o pracę Webasto i prędkość.
-        """
         tank_capacity = float(vehicle.fuel_tank_capacity_l or 46.0)
         base_consumption = float(vehicle.base_avg_consumption or 6.4)
-
         remaining_liters = (fuel_level_pct / 100.0) * tank_capacity
 
-        # Korekta spalania: Webasto pobiera ok. 0.3-0.4 L/h, a jazda >110 km/h zwiększa zużycie
         effective_consumption = base_consumption
         if webasto_active:
             effective_consumption += 0.35
@@ -81,11 +153,8 @@ class VehicleBusinessService:
         db: Session,
         vehicle_id: int,
         notif_type: str,
-        message: str
+        message: str,
     ) -> Notification | None:
-        """
-        Zapobiega duplikowaniu identycznych nieprzeczytanych powiadomień.
-        """
         existing = (
             db.query(Notification)
             .filter(
@@ -112,15 +181,8 @@ class VehicleBusinessService:
         cls,
         db: Session,
         vehicle_id: int,
-        payload: TelemetryIngestRequest
+        payload: TelemetryIngestRequest,
     ) -> tuple[VehicleTelemetry, list[Notification]]:
-        """
-        Przetwarza nową ramkę telemetrii z pojazdu / symulatora:
-        1. Wylicza szacowany zasięg (estimated_range_km).
-        2. Zapisuje rekord w `vehicle_telemetry` oraz opcjonalnie w `vehicle_locations`.
-        3. Sprawdza progi alarmowe (rezerwa paliwa, ciśnienie w oponach, akumulator).
-        4. Aktualizuje metryki dla Prometheusa.
-        """
         vehicle = cls.get_vehicle_or_404(db, vehicle_id)
         climate = vehicle.climate_setting
         webasto_on = bool(climate and climate.webasto_active)
@@ -145,29 +207,27 @@ class VehicleBusinessService:
         )
         db.add(telemetry)
 
-        # Zapis lokalizacji GPS jeśli przekazano współrzędne
         if payload.latitude is not None and payload.longitude is not None:
-            location = VehicleLocation(
-                vehicle_id=vehicle_id,
-                latitude=payload.latitude,
-                longitude=payload.longitude,
+            db.add(
+                VehicleLocation(
+                    vehicle_id=vehicle_id,
+                    latitude=payload.latitude,
+                    longitude=payload.longitude,
+                )
             )
-            db.add(location)
 
         generated_notifications: list[Notification] = []
 
-        # Reguła 1: Rezerwa paliwa (< 15%)
         if payload.fuel_level < 15.0:
             notif = cls._create_notification_if_not_recent(
                 db,
                 vehicle_id,
                 "LOW_FUEL",
-                f"Niski poziom paliwa ({payload.fuel_level:.1f}%). Szacowany zasięg: {estimated_range} km."
+                f"Niski poziom paliwa ({payload.fuel_level:.1f}%). Szacowany zasięg: {estimated_range} km.",
             )
             if notif:
                 generated_notifications.append(notif)
 
-        # Reguła 2: Automatyczne wyłączenie Webasto przy krytycznym poziomie paliwa (< 10%)
         if payload.fuel_level < 10.0 and climate and climate.webasto_active:
             climate.webasto_active = False
             climate.is_active = False
@@ -175,29 +235,27 @@ class VehicleBusinessService:
                 db,
                 vehicle_id,
                 "WEBASTO",
-                "Ogrzewanie postojowe Webasto zostało automatycznie wyłączone z powodu niskiego stanu paliwa (<10%)."
+                "Ogrzewanie postojowe Webasto zostało automatycznie wyłączone z powodu niskiego stanu paliwa (<10%).",
             )
             if notif:
                 generated_notifications.append(notif)
 
-        # Reguła 3: Spadek ciśnienia w oponach (< 28.0 PSI)
         if payload.tire_pressure_psi < 28.0:
             notif = cls._create_notification_if_not_recent(
                 db,
                 vehicle_id,
                 "TIRE_PRESSURE",
-                f"Wykryto niskie ciśnienie w ogumieniu ({payload.tire_pressure_psi:.1f} PSI). Zalecane: 32.0 PSI."
+                f"Wykryto niskie ciśnienie w ogumieniu ({payload.tire_pressure_psi:.1f} PSI). Zalecane: 32.0 PSI.",
             )
             if notif:
                 generated_notifications.append(notif)
 
-        # Reguła 4: Niskie napięcie akumulatora (< 11.8 V)
         if payload.battery_voltage < 11.8:
             notif = cls._create_notification_if_not_recent(
                 db,
                 vehicle_id,
                 "BATTERY_LOW",
-                f"Niskie napięcie akumulatora ({payload.battery_voltage:.2f} V). Ryzyko problemów z rozruchem."
+                f"Niskie napięcie akumulatora ({payload.battery_voltage:.2f} V). Ryzyko problemów z rozruchem.",
             )
             if notif:
                 generated_notifications.append(notif)
@@ -205,7 +263,6 @@ class VehicleBusinessService:
         db.commit()
         db.refresh(telemetry)
 
-        # Aktualizacja metryk Prometheus
         TELEMETRY_PACKETS_TOTAL.labels(vehicle_id=str(vehicle_id)).inc()
         VEHICLE_SPEED_GAUGE.labels(vehicle_id=str(vehicle_id)).set(payload.speed)
         VEHICLE_FUEL_GAUGE.labels(vehicle_id=str(vehicle_id)).set(payload.fuel_level)
@@ -218,12 +275,8 @@ class VehicleBusinessService:
         cls,
         db: Session,
         vehicle_id: int,
-        payload: ClimateUpdateRequest
+        payload: ClimateUpdateRequest,
     ) -> ClimateSettings:
-        """
-        Aktualizuje ustawienia ogrzewania Webasto oraz nawiewu (wentylatora 0-4).
-        Weryfikuje warunki bezpieczeństwa (poziom paliwa >= 10% oraz napięcie >= 11.5V).
-        """
         vehicle = cls.get_vehicle_or_404(db, vehicle_id)
         latest_telemetry = (
             db.query(VehicleTelemetry)
@@ -236,12 +289,12 @@ class VehicleBusinessService:
             if float(latest_telemetry.fuel_level) < 10.0:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Nie można uruchomić systemu Webasto: poziom paliwa poniżej 10%."
+                    detail="Nie można uruchomić systemu Webasto: poziom paliwa poniżej 10%.",
                 )
             if float(latest_telemetry.battery_voltage) < 11.5:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Nie można uruchomić systemu Webasto: napięcie akumulatora poniżej 11.5V."
+                    detail="Nie można uruchomić systemu Webasto: napięcie akumulatora poniżej 11.5V.",
                 )
 
         climate = vehicle.climate_setting
@@ -262,21 +315,18 @@ class VehicleBusinessService:
 
     @classmethod
     def set_central_lock(cls, db: Session, vehicle_id: int, is_locked: bool) -> Vehicle:
-        """
-        Zdalne sterowanie zamkiem centralnym.
-        Blokuje możliwość otwarcia/zamknięcia podczas ruchu pojazdu (> 5 km/h) lub zapisuje zdarzenie.
-        """
         vehicle = cls.get_vehicle_or_404(db, vehicle_id)
         vehicle.is_locked = is_locked
 
         state_label = "Zablokowano (zamknięto)" if is_locked else "Odblokowano (otwarto)"
-        notif = Notification(
-            vehicle_id=vehicle_id,
-            type="SECURITY",
-            message=f"{state_label} centralny zamek zdalnie z aplikacji.",
-            is_read=False,
+        db.add(
+            Notification(
+                vehicle_id=vehicle_id,
+                type="SECURITY",
+                message=f"{state_label} centralny zamek zdalnie z aplikacji.",
+                is_read=False,
+            )
         )
-        db.add(notif)
         db.commit()
         db.refresh(vehicle)
         return vehicle
@@ -286,11 +336,8 @@ class VehicleBusinessService:
         cls,
         db: Session,
         vehicle_id: int,
-        payload: ObdErrorCreateRequest
+        payload: ObdErrorCreateRequest,
     ) -> ObdError:
-        """
-        Zapisuje nowy kod błędu DTC z magistrali OBD-II i tworzy powiadomienie dla kierowcy.
-        """
         cls.get_vehicle_or_404(db, vehicle_id)
 
         existing = (
@@ -314,13 +361,14 @@ class VehicleBusinessService:
         )
         db.add(obd_err)
 
-        notif = Notification(
-            vehicle_id=vehicle_id,
-            type="OBD_ERROR",
-            message=f"Błąd OBD-II [{payload.code}]: {payload.description}",
-            is_read=False,
+        db.add(
+            Notification(
+                vehicle_id=vehicle_id,
+                type="OBD_ERROR",
+                message=f"Błąd OBD-II [{payload.code}]: {payload.description}",
+                is_read=False,
+            )
         )
-        db.add(notif)
         db.commit()
         db.refresh(obd_err)
 
@@ -334,10 +382,6 @@ class VehicleBusinessService:
 
     @classmethod
     def clear_obd_errors(cls, db: Session, vehicle_id: int) -> int:
-        """
-        Kasuje aktywne błędy OBD-II w sterowniku ECU.
-        Wymaga, aby pojazd był zatrzymany (speed == 0).
-        """
         cls.get_vehicle_or_404(db, vehicle_id)
         latest_telemetry = (
             db.query(VehicleTelemetry)
@@ -348,7 +392,7 @@ class VehicleBusinessService:
         if latest_telemetry and latest_telemetry.speed > 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Kasowanie błędów OBD-II jest dozwolone wyłącznie na postoju (prędkość 0 km/h)."
+                detail="Kasowanie błędów OBD-II jest dozwolone wyłącznie na postoju (prędkość 0 km/h).",
             )
 
         active_errors = (
@@ -374,6 +418,45 @@ class VehicleBusinessService:
         return cleared_count
 
     @classmethod
+    def mark_notification_read(
+        cls,
+        db: Session,
+        vehicle_id: int,
+        notification_id: int,
+    ) -> Notification:
+        cls.get_vehicle_or_404(db, vehicle_id)
+        notif = (
+            db.query(Notification)
+            .filter(Notification.id == notification_id, Notification.vehicle_id == vehicle_id)
+            .first()
+        )
+        if not notif:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Powiadomienie o ID={notification_id} dla pojazdu ID={vehicle_id} nie istnieje.",
+            )
+        notif.is_read = True
+        db.commit()
+        db.refresh(notif)
+        return notif
+
+    @classmethod
+    def delete_notification(cls, db: Session, vehicle_id: int, notification_id: int) -> None:
+        cls.get_vehicle_or_404(db, vehicle_id)
+        notif = (
+            db.query(Notification)
+            .filter(Notification.id == notification_id, Notification.vehicle_id == vehicle_id)
+            .first()
+        )
+        if not notif:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Powiadomienie o ID={notification_id} dla pojazdu ID={vehicle_id} nie istnieje.",
+            )
+        db.delete(notif)
+        db.commit()
+
+    @classmethod
     def start_trip(cls, db: Session, vehicle_id: int, payload: TripStartRequest) -> Trip:
         cls.get_vehicle_or_404(db, vehicle_id)
         trip = Trip(
@@ -390,17 +473,22 @@ class VehicleBusinessService:
 
     @classmethod
     def end_trip(cls, db: Session, vehicle_id: int, trip_id: int, payload: TripEndRequest) -> Trip:
-        """
-        Kończy trasę i wylicza średnie spalanie oraz wynik Ecodrivingu (0-100 pkt)
-        na podstawie próbek telemetrii zarejestrowanych od momentu startu trasy.
-        """
+        cls.get_vehicle_or_404(db, vehicle_id)
         trip = (
             db.query(Trip)
             .filter(Trip.id == trip_id, Trip.vehicle_id == vehicle_id)
             .first()
         )
         if not trip:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trasa nie została znaleziona.")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Trasa o ID={trip_id} dla pojazdu ID={vehicle_id} nie została znaleziona.",
+            )
+        if trip.ended_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Trasa o ID={trip_id} została już wcześniej zakończona.",
+            )
 
         samples = (
             db.query(VehicleTelemetry)
@@ -443,3 +531,19 @@ class VehicleBusinessService:
         db.commit()
         db.refresh(trip)
         return trip
+
+    @classmethod
+    def delete_trip(cls, db: Session, vehicle_id: int, trip_id: int) -> None:
+        cls.get_vehicle_or_404(db, vehicle_id)
+        trip = (
+            db.query(Trip)
+            .filter(Trip.id == trip_id, Trip.vehicle_id == vehicle_id)
+            .first()
+        )
+        if not trip:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Trasa o ID={trip_id} dla pojazdu ID={vehicle_id} nie istnieje.",
+            )
+        db.delete(trip)
+        db.commit()
