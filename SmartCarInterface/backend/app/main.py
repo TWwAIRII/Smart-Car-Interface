@@ -9,6 +9,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from app.core.database import Base, engine, SessionLocal
 from app.core.security import get_password_hash
 from app.core.metrics import API_REQUEST_LATENCY
+from app.core.exceptions import register_exception_handlers
 from app.models.entities import (
     User,
     Vehicle,
@@ -94,10 +95,13 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SmartCarInterface API",
-    description="Backend systemu Connected Car (Telemetria, OBD-II, Webasto, Zamek Centralny, Panel Admina, Prometheus).",
-    version="1.0.0",
+    description="Backend systemu Connected Car (REST API CRUD, Telemetria, OBD-II, Webasto, Zamek Centralny, Panel Admina, Prometheus).",
+    version="1.1.0",
     lifespan=lifespan,
 )
+
+# Rejestracja globalnej obsługi błędów i wyjątków
+register_exception_handlers(app)
 
 app.add_middleware(
     CORSMiddleware,

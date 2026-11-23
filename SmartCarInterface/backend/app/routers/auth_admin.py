@@ -1,5 +1,5 @@
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -17,7 +17,7 @@ router = APIRouter(prefix="/api", tags=["Użytkownicy i Panel Administratora"])
 
 @router.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register_user(payload: UserCreate, db: Session = Depends(get_db)):
-    """Rejestracja nowego konta użytkownika w systemie."""
+    """[REST POST] Rejestracja nowego konta użytkownika (201 Created lub 409 Conflict)."""
     existing = (
         db.query(User)
         .filter((User.username == payload.username) | (User.email == payload.email))
@@ -25,8 +25,8 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)):
     )
     if existing:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Użytkownik o podanym loginie lub adresie e-mail już istnieje."
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Użytkownik o podanym loginie lub adresie e-mail już istnieje.",
         )
 
     user = User(
@@ -42,19 +42,19 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)):
     return user
 
 
-@router.post("/auth/login")
+@router.post("/auth/login", status_code=status.HTTP_200_OK)
 def login_user(payload: UserLogin, db: Session = Depends(get_db)):
-    """Logowanie użytkownika i generowanie tokenu JWT."""
+    """[REST POST] Logowanie użytkownika i generowanie tokenu JWT (401 lub 403 przy blokadzie)."""
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Nieprawidłowa nazwa użytkownika lub hasło."
+            detail="Nieprawidłowa nazwa użytkownika lub hasło.",
         )
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Konto zostało dezaktywowane przez administratora."
+            detail="Konto zostało dezaktywowane przez administratora.",
         )
 
     token = create_access_token({"sub": user.username, "role": user.role, "user_id": user.id})
@@ -71,26 +71,45 @@ def login_user(payload: UserLogin, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/admin/users", response_model=List[UserResponse])
+@router.get("/admin/users", response_model=List[UserResponse], status_code=status.HTTP_200_OK)
 def list_all_users(
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
-    """[Panel Administratora] Pobiera spis wszystkich zarejestrowanych użytkowników."""
+    """[Panel Administratora / GET] Pobiera spis wszystkich zarejestrowanych użytkowników."""
     return db.query(User).order_by(User.id.asc()).all()
 
 
-@router.patch("/admin/users/{user_id}/status", response_model=UserResponse)
+@router.get("/admin/users/{user_id}", response_model=UserResponse, status_code=status.HTTP_200_OK)
+def get_user_by_id(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """[Panel Administratora / GET] Pobiera szczegóły pojedynczego użytkownika (404 jeśli brak)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Użytkownik o ID={user_id} nie istnieje.",
+        )
+    return user
+
+
+@router.patch("/admin/users/{user_id}/status", response_model=UserResponse, status_code=status.HTTP_200_OK)
 def change_user_status(
     user_id: int,
     payload: UserStatusUpdate,
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
-    """[Panel Administratora] Zmienia status użytkownika (aktywny / nieaktywny) oraz opcjonalnie rolę."""
+    """[Panel Administratora / PATCH] Zmienia status użytkownika (aktywny / nieaktywny) oraz opcjonalnie rolę."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Użytkownik nie istnieje.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Użytkownik o ID={user_id} nie istnieje.",
+        )
 
     user.is_active = payload.is_active
     if payload.role:
@@ -99,3 +118,26 @@ def change_user_status(
     db.commit()
     db.refresh(user)
     return user
+
+
+@router.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """[Panel Administratora / DELETE] Usuwa konto użytkownika (204 No Content, blokuje usunięcie własnego konta)."""
+    if admin.id == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Administrator nie może usunąć własnego konta.",
+        )
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Użytkownik o ID={user_id} nie istnieje.",
+        )
+    db.delete(user)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

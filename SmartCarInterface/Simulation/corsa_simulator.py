@@ -60,42 +60,33 @@ class GreenCorsaSimulator:
     def step_physics(self):
         self.step_counter += 1
 
-        # Cykl jazdy i postoju (co kilkadziesiąt kroków auto zatrzymuje się lub rusza)
-        phase = (self.step_counter % 60)
+        phase = self.step_counter % 60
         if phase < 40 and not self.is_locked:
-            # Auto w ruchu
             self.is_driving = True
             target_speed = 45 + int(25 * math.sin(self.step_counter * 0.15))
             self.speed = max(0, min(115, target_speed + random.randint(-3, 3)))
             self.engine_rpm = 1800 + int(self.speed * 26) + random.randint(-80, 80)
             self.battery_voltage = round(14.15 + random.uniform(-0.1, 0.1), 2)
-
-            # Zużycie paliwa w trakcie jazdy
             self.fuel_level = max(5.0, self.fuel_level - 0.03)
-
-            # Przemieszczanie GPS
             self.lat += 0.00018 * math.cos(self.step_counter * 0.05)
             self.lon += 0.00024 * math.sin(self.step_counter * 0.05)
         else:
-            # Postój
             self.is_driving = False
             self.speed = 0
             self.engine_rpm = 0
-            self.battery_voltage = round(12.55 - (0.15 if self.webasto_active else 0.0) + random.uniform(-0.04, 0.04), 2)
+            self.battery_voltage = round(
+                12.55 - (0.15 if self.webasto_active else 0.0) + random.uniform(-0.04, 0.04), 2
+            )
 
-        # Fizyka temperatury w kabinie (Webasto + wentylator nawiewu)
         fan_multiplier = 1.0 + (self.fan_speed * 0.25)
         if self.webasto_active:
-            # Webasto dogrzewa kabinę do temperatury docelowej
             diff = self.target_temp - self.interior_temp
             self.interior_temp += (0.22 * fan_multiplier) if diff > 0 else -0.05
             self.fuel_level = max(5.0, self.fuel_level - 0.01)
         elif self.climate_active and self.fan_speed > 0:
-            # Sama wentylacja wyrównuje temperaturę w stronę zewnętrznej lub lekko chłodzi pędem powietrza
             diff = self.exterior_temp - self.interior_temp
             self.interior_temp += diff * 0.08 * fan_multiplier
         else:
-            # Naturalne wychładzanie / nagrzewanie do temperatury otoczenia
             diff = self.exterior_temp - self.interior_temp
             self.interior_temp += diff * 0.03
 
@@ -121,7 +112,7 @@ class GreenCorsaSimulator:
                 json=payload,
                 timeout=3,
             )
-            if resp.status_code == 200:
+            if resp.status_code in (200, 201):
                 data = resp.json()
                 print(
                     f"[Corsa B Sim] V={self.speed} km/h | RPM={self.engine_rpm} | "
@@ -132,7 +123,6 @@ class GreenCorsaSimulator:
             print(f"[Corsa B Sim] Błąd wysyłania telemetrii: {exc}")
 
     def maybe_trigger_obd_fault(self):
-        """Co pewną liczbę kroków z małym prawdopodobieństwem symuluje wystąpienie błędu OBD-II."""
         if self.step_counter % 45 == 0 and random.random() < 0.35:
             code, desc, severity = random.choice(CORSA_OBD_CATALOG)
             try:

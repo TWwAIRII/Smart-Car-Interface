@@ -1,5 +1,5 @@
 from typing import List
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Response, status
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
@@ -13,6 +13,9 @@ from app.models.entities import (
     ObdError,
 )
 from app.schemas.dto import (
+    VehicleCreateRequest,
+    VehicleUpdateRequest,
+    VehicleResponse,
     VehicleDashboardResponse,
     TelemetryIngestRequest,
     TelemetryResponse,
@@ -32,7 +35,46 @@ from app.services.vehicle_service import VehicleBusinessService
 router = APIRouter(prefix="/api/vehicles", tags=["Pojazd, Telemetria i Sterowanie"])
 
 
-@router.get("/{vehicle_id}/dashboard", response_model=VehicleDashboardResponse)
+# ==================== CRUD GŁÓWNEGO ZASOBU: VEHICLES ====================
+
+@router.get("", response_model=List[VehicleResponse], status_code=status.HTTP_200_OK)
+def list_vehicles(db: Session = Depends(get_db)):
+    """[REST GET] Pobiera listę wszystkich zarejestrowanych pojazdów."""
+    return VehicleBusinessService.list_vehicles(db)
+
+
+@router.post("", response_model=VehicleResponse, status_code=status.HTTP_201_CREATED)
+def create_vehicle(payload: VehicleCreateRequest, db: Session = Depends(get_db)):
+    """[REST POST] Dodaje nowy pojazd do systemu (zwraca 201 Created lub 409 Conflict dla duplikatu VIN)."""
+    return VehicleBusinessService.create_vehicle(db, payload)
+
+
+@router.get("/{vehicle_id}", response_model=VehicleResponse, status_code=status.HTTP_200_OK)
+def get_vehicle(vehicle_id: int, db: Session = Depends(get_db)):
+    """[REST GET] Pobiera podstawowe dane pojedynczego pojazdu (404 jeśli nie istnieje)."""
+    return VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
+
+
+@router.put("/{vehicle_id}", response_model=VehicleResponse, status_code=status.HTTP_200_OK)
+def update_vehicle(
+    vehicle_id: int,
+    payload: VehicleUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """[REST PUT] Aktualizuje dane pojazdu (404 jeśli brak zasobu, 409 przy konflikcie VIN)."""
+    return VehicleBusinessService.update_vehicle(db, vehicle_id, payload)
+
+
+@router.delete("/{vehicle_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)):
+    """[REST DELETE] Usuwa pojazd wraz z powiązanymi rekordami (zwraca 204 No Content)."""
+    VehicleBusinessService.delete_vehicle(db, vehicle_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ==================== DASHBOARD, TELEMETRIA I STEROWANIE ====================
+
+@router.get("/{vehicle_id}/dashboard", response_model=VehicleDashboardResponse, status_code=status.HTTP_200_OK)
 def get_vehicle_dashboard(vehicle_id: int, db: Session = Depends(get_db)):
     """
     [Dashboard] Zwraca kompletny stan pojazdu: ostatnią telemetrię, ustawienia Webasto/nawiewu,
@@ -79,21 +121,21 @@ def get_vehicle_dashboard(vehicle_id: int, db: Session = Depends(get_db)):
         "unread_notifications": unread_notifs,
         "latest_location": latest_location,
         "camera_streams": {
-            "front_camera_mp4": f"/media/front_camera.mp4",
-            "rear_camera_mp4": f"/media/rear_camera.mp4",
+            "front_camera_mp4": "/media/front_camera.mp4",
+            "rear_camera_mp4": "/media/rear_camera.mp4",
         },
     }
 
 
-@router.post("/{vehicle_id}/telemetry", response_model=TelemetryResponse)
+@router.post("/{vehicle_id}/telemetry", response_model=TelemetryResponse, status_code=status.HTTP_201_CREATED)
 async def ingest_telemetry(
     vehicle_id: int,
     payload: TelemetryIngestRequest,
     db: Session = Depends(get_db),
 ):
     """
-    Odbiera nową paczkę telemetrii z modułu pojazdu / symulatora, przelicza zasięg
-    i natychmiast rozsyła zaktualizowany stan przez WebSocket do podłączonych klientów.
+    [REST POST] Zapisuje nową paczkę telemetrii z modułu pojazdu / symulatora (201 Created)
+    i natychmiast rozsyła zaktualizowany stan przez WebSocket.
     """
     telemetry, new_notifs = VehicleBusinessService.process_incoming_telemetry(db, vehicle_id, payload)
     vehicle = VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
@@ -125,13 +167,13 @@ async def ingest_telemetry(
     return telemetry
 
 
-@router.put("/{vehicle_id}/climate", response_model=ClimateResponse)
+@router.put("/{vehicle_id}/climate", response_model=ClimateResponse, status_code=status.HTTP_200_OK)
 async def update_climate_and_webasto(
     vehicle_id: int,
     payload: ClimateUpdateRequest,
     db: Session = Depends(get_db),
 ):
-    """[Zarządzanie] Sterowanie ogrzewaniem postojowym Webasto, temperaturą docelową i nawiewem (0-4)."""
+    """[REST PUT / Zarządzanie] Sterowanie ogrzewaniem postojowym Webasto, temperaturą docelową i nawiewem (0-4)."""
     climate = VehicleBusinessService.update_climate_settings(db, vehicle_id, payload)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -150,13 +192,13 @@ async def update_climate_and_webasto(
     return climate
 
 
-@router.post("/{vehicle_id}/lock")
+@router.post("/{vehicle_id}/lock", status_code=status.HTTP_200_OK)
 async def control_central_lock(
     vehicle_id: int,
     payload: LockUpdateRequest,
     db: Session = Depends(get_db),
 ):
-    """[Zarządzanie] Zdalne otwieranie i zamykanie zamka centralnego."""
+    """[REST POST / Zarządzanie] Zdalne otwieranie i zamykanie zamka centralnego."""
     vehicle = VehicleBusinessService.set_central_lock(db, vehicle_id, payload.is_locked)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -169,22 +211,25 @@ async def control_central_lock(
     return {"vehicle_id": vehicle.id, "is_locked": vehicle.is_locked}
 
 
-@router.get("/{vehicle_id}/obd", response_model=List[ObdErrorResponse])
+# ==================== DIAGNOSTYKA OBD-II ====================
+
+@router.get("/{vehicle_id}/obd", response_model=List[ObdErrorResponse], status_code=status.HTTP_200_OK)
 def get_obd_errors(vehicle_id: int, active_only: bool = True, db: Session = Depends(get_db)):
-    """Pobiera listę kodów błędów diagnostycznych z komputera OBD-II."""
+    """[REST GET] Pobiera listę kodów błędów diagnostycznych OBD-II (404 jeśli pojazd nie istnieje)."""
+    VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     query = db.query(ObdError).filter(ObdError.vehicle_id == vehicle_id)
     if active_only:
         query = query.filter(ObdError.is_active.is_(True))
     return query.order_by(desc(ObdError.detected_at)).all()
 
 
-@router.post("/{vehicle_id}/obd", response_model=ObdErrorResponse)
+@router.post("/{vehicle_id}/obd", response_model=ObdErrorResponse, status_code=status.HTTP_201_CREATED)
 async def report_obd_error(
     vehicle_id: int,
     payload: ObdErrorCreateRequest,
     db: Session = Depends(get_db),
 ):
-    """Rejestruje nowy kod błędu OBD-II zgłoszony przez pojazd/symulator."""
+    """[REST POST] Rejestruje nowy kod błędu OBD-II zgłoszony przez pojazd/symulator (201 Created)."""
     err = VehicleBusinessService.register_obd_error(db, vehicle_id, payload)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -202,9 +247,9 @@ async def report_obd_error(
     return err
 
 
-@router.delete("/{vehicle_id}/obd")
+@router.delete("/{vehicle_id}/obd", status_code=status.HTTP_200_OK)
 async def clear_obd_errors(vehicle_id: int, db: Session = Depends(get_db)):
-    """[Zarządzanie] Kasuje aktywne kody błędów OBD-II w sterowniku pojazdu."""
+    """[REST DELETE] Kasuje aktywne kody błędów OBD-II w sterowniku pojazdu (400 jeśli pojazd w ruchu)."""
     cleared = VehicleBusinessService.clear_obd_errors(db, vehicle_id)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -213,8 +258,12 @@ async def clear_obd_errors(vehicle_id: int, db: Session = Depends(get_db)):
     return {"vehicle_id": vehicle_id, "cleared_count": cleared}
 
 
-@router.get("/{vehicle_id}/notifications", response_model=List[NotificationResponse])
+# ==================== POWIADOMIENIA (NOTIFICATIONS) ====================
+
+@router.get("/{vehicle_id}/notifications", response_model=List[NotificationResponse], status_code=status.HTTP_200_OK)
 def get_notifications(vehicle_id: int, db: Session = Depends(get_db)):
+    """[REST GET] Pobiera historię powiadomień dla pojazdu (404 jeśli pojazd nie istnieje)."""
+    VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     return (
         db.query(Notification)
         .filter(Notification.vehicle_id == vehicle_id)
@@ -224,22 +273,32 @@ def get_notifications(vehicle_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.patch("/{vehicle_id}/notifications/{notification_id}/read", response_model=NotificationResponse)
+@router.patch(
+    "/{vehicle_id}/notifications/{notification_id}/read",
+    response_model=NotificationResponse,
+    status_code=status.HTTP_200_OK,
+)
 def mark_notification_read(vehicle_id: int, notification_id: int, db: Session = Depends(get_db)):
-    notif = (
-        db.query(Notification)
-        .filter(Notification.id == notification_id, Notification.vehicle_id == vehicle_id)
-        .first()
-    )
-    if notif:
-        notif.is_read = True
-        db.commit()
-        db.refresh(notif)
-    return notif
+    """[REST PATCH] Oznacza wskazane powiadomienie jako przeczytane (zwraca 404 jeśli nie istnieje)."""
+    return VehicleBusinessService.mark_notification_read(db, vehicle_id, notification_id)
 
 
-@router.get("/{vehicle_id}/locations", response_model=List[LocationResponse])
+@router.delete(
+    "/{vehicle_id}/notifications/{notification_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_notification(vehicle_id: int, notification_id: int, db: Session = Depends(get_db)):
+    """[REST DELETE] Usuwa powiadomienie (zwraca 204 No Content lub 404 Not Found)."""
+    VehicleBusinessService.delete_notification(db, vehicle_id, notification_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ==================== LOKALIZACJE I TRASY (LOCATIONS & TRIPS) ====================
+
+@router.get("/{vehicle_id}/locations", response_model=List[LocationResponse], status_code=status.HTTP_200_OK)
 def get_location_history(vehicle_id: int, limit: int = 50, db: Session = Depends(get_db)):
+    """[REST GET] Pobiera historię pozycji GPS pojazdu (404 jeśli pojazd nie istnieje)."""
+    VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     return (
         db.query(VehicleLocation)
         .filter(VehicleLocation.vehicle_id == vehicle_id)
@@ -249,8 +308,10 @@ def get_location_history(vehicle_id: int, limit: int = 50, db: Session = Depends
     )
 
 
-@router.get("/{vehicle_id}/trips", response_model=List[TripResponse])
+@router.get("/{vehicle_id}/trips", response_model=List[TripResponse], status_code=status.HTTP_200_OK)
 def get_trips(vehicle_id: int, db: Session = Depends(get_db)):
+    """[REST GET] Pobiera listę tras pojazdu (404 jeśli pojazd nie istnieje)."""
+    VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     return (
         db.query(Trip)
         .filter(Trip.vehicle_id == vehicle_id)
@@ -259,20 +320,31 @@ def get_trips(vehicle_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/{vehicle_id}/trips/start", response_model=TripResponse)
+@router.post("/{vehicle_id}/trips/start", response_model=TripResponse, status_code=status.HTTP_201_CREATED)
 def start_vehicle_trip(vehicle_id: int, payload: TripStartRequest, db: Session = Depends(get_db)):
+    """[REST POST] Rozpoczyna nową trasę pojazdu (201 Created)."""
     return VehicleBusinessService.start_trip(db, vehicle_id, payload)
 
 
-@router.post("/{vehicle_id}/trips/{trip_id}/end", response_model=TripResponse)
+@router.post("/{vehicle_id}/trips/{trip_id}/end", response_model=TripResponse, status_code=status.HTTP_200_OK)
 def end_vehicle_trip(
     vehicle_id: int,
     trip_id: int,
     payload: TripEndRequest,
     db: Session = Depends(get_db),
 ):
+    """[REST POST] Kończy trasę i wylicza Ecodriving (404 jeśli brak trasy, 409 jeśli już zakończona)."""
     return VehicleBusinessService.end_trip(db, vehicle_id, trip_id, payload)
 
+
+@router.delete("/{vehicle_id}/trips/{trip_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_vehicle_trip(vehicle_id: int, trip_id: int, db: Session = Depends(get_db)):
+    """[REST DELETE] Usuwa zapisaną trasę (zwraca 204 No Content lub 404 Not Found)."""
+    VehicleBusinessService.delete_trip(db, vehicle_id, trip_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ==================== WEBSOCKET ====================
 
 @router.websocket("/ws/{vehicle_id}")
 async def vehicle_telemetry_websocket(websocket: WebSocket, vehicle_id: int):
@@ -284,7 +356,6 @@ async def vehicle_telemetry_websocket(websocket: WebSocket, vehicle_id: int):
     try:
         while True:
             data = await websocket.receive_json()
-            # Pozwala również na przesyłanie pingów lub komend przez WS
             if data.get("action") == "PING":
                 await websocket.send_json({"event": "PONG", "vehicle_id": vehicle_id})
     except WebSocketDisconnect:
