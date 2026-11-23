@@ -1,0 +1,78 @@
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: smartcar_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smartcar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartcar_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-smartcar_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartcar -d smartcar_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    container_name: smartcar_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://smartcar:smartcar_secret@db:5432/smartcar_db
+      JWT_SECRET_KEY: super_tajny_klucz_jwt_smart_car_interface
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./Simulation/media:/app/media
+
+  simulator:
+    build:
+      context: ./Simulation
+    container_name: smartcar_simulator
+    restart: unless-stopped
+    environment:
+      BACKEND_API_URL: http://backend:8000/api
+      VEHICLE_ID: "1"
+      SIMULATION_INTERVAL_SEC: "2.0"
+    depends_on:
+      - backend
+    volumes:
+      - ./Simulation:/app
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: smartcar_prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: smartcar_grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
