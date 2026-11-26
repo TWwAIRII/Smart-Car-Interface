@@ -7,6 +7,8 @@ import requests
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8000/api")
 VEHICLE_ID = int(os.getenv("VEHICLE_ID", "1"))
 INTERVAL_SEC = float(os.getenv("SIMULATION_INTERVAL_SEC", "2.0"))
+SIMULATOR_USERNAME = os.getenv("SIMULATOR_USERNAME", "kierowca")
+SIMULATOR_PASSWORD = os.getenv("SIMULATOR_PASSWORD", "corsa123")
 
 # Katalog realistycznych kodów błędów OBD-II dla Opla Corsy B (silniki X14XE / X12SZ)
 CORSA_OBD_CATALOG = [
@@ -41,10 +43,56 @@ class GreenCorsaSimulator:
         self.fan_speed = 1
         self.is_locked = True
 
+        # Sesja i token JWT
+        self.access_token = None
+
+    def _auth_headers(self) -> dict:
+        if not self.access_token:
+            return {}
+        return {"Authorization": f"Bearer {self.access_token}"}
+
+    def authenticate(self) -> bool:
+        """Loguje symulator do chronionego API i pobiera token JWT."""
+        try:
+            resp = requests.post(
+                f"{BACKEND_API_URL}/auth/login",
+                json={"username": SIMULATOR_USERNAME, "password": SIMULATOR_PASSWORD},
+                timeout=3,
+            )
+            if resp.status_code == 200:
+                self.access_token = resp.json().get("access_token")
+                print(f"[Simulator] Zalogowano pomyślnie jako '{SIMULATOR_USERNAME}' (JWT aktywny).")
+                return True
+            print(
+                f"[Simulator] Błąd logowania ({resp.status_code}): {resp.text}"
+            )
+        except Exception as exc:
+            print(f"[Simulator] Oczekiwanie na backend podczas logowania: {exc}")
+        return False
+
+    def ensure_authenticated(self) -> bool:
+        if self.access_token:
+            return True
+        return self.authenticate()
+
     def sync_state_from_server(self):
         """Pobiera aktualne nastawy Webasto, nawiewu i zamka z serwera."""
+        if not self.ensure_authenticated():
+            return
         try:
-            resp = requests.get(f"{BACKEND_API_URL}/vehicles/{VEHICLE_ID}/dashboard", timeout=3)
+            resp = requests.get(
+                f"{BACKEND_API_URL}/vehicles/{VEHICLE_ID}/dashboard",
+                headers=self._auth_headers(),
+                timeout=3,
+            )
+            if resp.status_code == 401:
+                self.access_token = None
+                if self.authenticate():
+                    resp = requests.get(
+                        f"{BACKEND_API_URL}/vehicles/{VEHICLE_ID}/dashboard",
+                        headers=self._auth_headers(),
+                        timeout=3,
+                    )
             if resp.status_code == 200:
                 data = resp.json()
                 self.is_locked = data.get("is_locked", True)
@@ -95,6 +143,8 @@ class GreenCorsaSimulator:
         self.tire_pressure_psi = round(31.8 + random.uniform(-0.2, 0.2), 1)
 
     def send_telemetry(self):
+        if not self.ensure_authenticated():
+            return
         payload = {
             "speed": self.speed,
             "fuel_level": self.fuel_level,
@@ -110,8 +160,18 @@ class GreenCorsaSimulator:
             resp = requests.post(
                 f"{BACKEND_API_URL}/vehicles/{VEHICLE_ID}/telemetry",
                 json=payload,
+                headers=self._auth_headers(),
                 timeout=3,
             )
+            if resp.status_code == 401:
+                self.access_token = None
+                if self.authenticate():
+                    resp = requests.post(
+                        f"{BACKEND_API_URL}/vehicles/{VEHICLE_ID}/telemetry",
+                        json=payload,
+                        headers=self._auth_headers(),
+                        timeout=3,
+                    )
             if resp.status_code in (200, 201):
                 data = resp.json()
                 print(
@@ -123,12 +183,15 @@ class GreenCorsaSimulator:
             print(f"[Corsa B Sim] Błąd wysyłania telemetrii: {exc}")
 
     def maybe_trigger_obd_fault(self):
+        if not self.access_token:
+            return
         if self.step_counter % 45 == 0 and random.random() < 0.35:
             code, desc, severity = random.choice(CORSA_OBD_CATALOG)
             try:
                 requests.post(
                     f"{BACKEND_API_URL}/vehicles/{VEHICLE_ID}/obd",
                     json={"code": code, "description": desc, "severity": severity},
+                    headers=self._auth_headers(),
                     timeout=3,
                 )
                 print(f"[Corsa B Sim] Wygenerowano kod błędu OBD-II: {code} ({desc})")

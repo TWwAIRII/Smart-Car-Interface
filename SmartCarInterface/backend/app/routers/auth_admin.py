@@ -1,5 +1,6 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -7,17 +8,46 @@ from app.core.security import (
     get_password_hash,
     verify_password,
     create_access_token,
+    get_current_user,
     require_admin,
 )
 from app.models.entities import User
 from app.schemas.dto import UserCreate, UserLogin, UserResponse, UserStatusUpdate
 
-router = APIRouter(prefix="/api", tags=["Użytkownicy i Panel Administratora"])
+router = APIRouter(prefix="/api", tags=["Użytkownicy, Autoryzacja i Panel Administratora"])
+
+
+def _authenticate_and_issue_token(username: str, password: str, db: Session) -> dict:
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not verify_password(password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Nieprawidłowa nazwa użytkownika lub hasło.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Konto zostało dezaktywowane przez administratora.",
+        )
+
+    token = create_access_token({"sub": user.username, "role": user.role, "user_id": user.id})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": user.role,
+            "is_active": user.is_active,
+        },
+    }
 
 
 @router.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register_user(payload: UserCreate, db: Session = Depends(get_db)):
-    """[REST POST] Rejestracja nowego konta użytkownika (201 Created lub 409 Conflict)."""
+    """[Public] Rejestracja nowego konta użytkownika (201 Created lub 409 Conflict)."""
     existing = (
         db.query(User)
         .filter((User.username == payload.username) | (User.email == payload.email))
@@ -44,31 +74,23 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 @router.post("/auth/login", status_code=status.HTTP_200_OK)
 def login_user(payload: UserLogin, db: Session = Depends(get_db)):
-    """[REST POST] Logowanie użytkownika i generowanie tokenu JWT (401 lub 403 przy blokadzie)."""
-    user = db.query(User).filter(User.username == payload.username).first()
-    if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Nieprawidłowa nazwa użytkownika lub hasło.",
-        )
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Konto zostało dezaktywowane przez administratora.",
-        )
+    """[Public / JSON] Logowanie użytkownika (React Native / Symulator) i wydanie tokenu JWT."""
+    return _authenticate_and_issue_token(payload.username, payload.password, db)
 
-    token = create_access_token({"sub": user.username, "role": user.role, "user_id": user.id})
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "role": user.role,
-            "is_active": user.is_active,
-        },
-    }
+
+@router.post("/auth/token", status_code=status.HTTP_200_OK)
+def login_oauth2_form(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    """[Public / OAuth2 Form] Logowanie formularzem kompatybilne z przyciskiem Authorize w Swagger UI."""
+    return _authenticate_and_issue_token(form_data.username, form_data.password, db)
+
+
+@router.get("/auth/me", response_model=UserResponse, status_code=status.HTTP_200_OK)
+def get_my_profile(current_user: User = Depends(get_current_user)):
+    """[JWT] Zwraca dane aktualnie zalogowanego użytkownika na podstawie tokenu Bearer."""
+    return current_user
 
 
 @router.get("/admin/users", response_model=List[UserResponse], status_code=status.HTTP_200_OK)
