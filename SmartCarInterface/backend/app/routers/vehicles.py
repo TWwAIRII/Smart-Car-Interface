@@ -1,11 +1,18 @@
-from typing import List
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Response, status
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, Response, status
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
+from app.core.security import (
+    get_current_user,
+    require_driver_or_admin,
+    require_admin,
+    get_user_from_token_str,
+)
 from app.core.ws_manager import ws_manager
 from app.models.entities import (
+    User,
     VehicleTelemetry,
     Notification,
     VehicleLocation,
@@ -38,20 +45,31 @@ router = APIRouter(prefix="/api/vehicles", tags=["Pojazd, Telemetria i Sterowani
 # ==================== CRUD GŁÓWNEGO ZASOBU: VEHICLES ====================
 
 @router.get("", response_model=List[VehicleResponse], status_code=status.HTTP_200_OK)
-def list_vehicles(db: Session = Depends(get_db)):
-    """[REST GET] Pobiera listę wszystkich zarejestrowanych pojazdów."""
+def list_vehicles(
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """[JWT: admin/driver/guest] Pobiera listę wszystkich zarejestrowanych pojazdów."""
     return VehicleBusinessService.list_vehicles(db)
 
 
 @router.post("", response_model=VehicleResponse, status_code=status.HTTP_201_CREATED)
-def create_vehicle(payload: VehicleCreateRequest, db: Session = Depends(get_db)):
-    """[REST POST] Dodaje nowy pojazd do systemu (zwraca 201 Created lub 409 Conflict dla duplikatu VIN)."""
+def create_vehicle(
+    payload: VehicleCreateRequest,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """[JWT: admin] Dodaje nowy pojazd do systemu (201 Created lub 409 Conflict)."""
     return VehicleBusinessService.create_vehicle(db, payload)
 
 
 @router.get("/{vehicle_id}", response_model=VehicleResponse, status_code=status.HTTP_200_OK)
-def get_vehicle(vehicle_id: int, db: Session = Depends(get_db)):
-    """[REST GET] Pobiera podstawowe dane pojedynczego pojazdu (404 jeśli nie istnieje)."""
+def get_vehicle(
+    vehicle_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """[JWT: admin/driver/guest] Pobiera podstawowe dane pojedynczego pojazdu."""
     return VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
 
 
@@ -60,14 +78,19 @@ def update_vehicle(
     vehicle_id: int,
     payload: VehicleUpdateRequest,
     db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
 ):
-    """[REST PUT] Aktualizuje dane pojazdu (404 jeśli brak zasobu, 409 przy konflikcie VIN)."""
+    """[JWT: admin] Aktualizuje dane pojazdu."""
     return VehicleBusinessService.update_vehicle(db, vehicle_id, payload)
 
 
 @router.delete("/{vehicle_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)):
-    """[REST DELETE] Usuwa pojazd wraz z powiązanymi rekordami (zwraca 204 No Content)."""
+def delete_vehicle(
+    vehicle_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """[JWT: admin] Usuwa pojazd wraz z powiązanymi rekordami (204 No Content)."""
     VehicleBusinessService.delete_vehicle(db, vehicle_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -75,10 +98,14 @@ def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)):
 # ==================== DASHBOARD, TELEMETRIA I STEROWANIE ====================
 
 @router.get("/{vehicle_id}/dashboard", response_model=VehicleDashboardResponse, status_code=status.HTTP_200_OK)
-def get_vehicle_dashboard(vehicle_id: int, db: Session = Depends(get_db)):
+def get_vehicle_dashboard(
+    vehicle_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
     """
-    [Dashboard] Zwraca kompletny stan pojazdu: ostatnią telemetrię, ustawienia Webasto/nawiewu,
-    stan zamka centralnego, aktywne błędy OBD-II, nieprzeczytane powiadomienia oraz linki do kamer.
+    [JWT: admin/driver/guest] Zwraca kompletny stan pojazdu: ostatnią telemetrię,
+    ustawienia Webasto/nawiewu, stan zamka centralnego, błędy OBD-II, powiadomienia oraz kamery.
     """
     vehicle = VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
 
@@ -132,9 +159,10 @@ async def ingest_telemetry(
     vehicle_id: int,
     payload: TelemetryIngestRequest,
     db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
 ):
     """
-    [REST POST] Zapisuje nową paczkę telemetrii z modułu pojazdu / symulatora (201 Created)
+    [JWT: driver/admin] Zapisuje nową paczkę telemetrii z modułu pojazdu / symulatora (201 Created)
     i natychmiast rozsyła zaktualizowany stan przez WebSocket.
     """
     telemetry, new_notifs = VehicleBusinessService.process_incoming_telemetry(db, vehicle_id, payload)
@@ -172,8 +200,9 @@ async def update_climate_and_webasto(
     vehicle_id: int,
     payload: ClimateUpdateRequest,
     db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
 ):
-    """[REST PUT / Zarządzanie] Sterowanie ogrzewaniem postojowym Webasto, temperaturą docelową i nawiewem (0-4)."""
+    """[JWT: driver/admin] Sterowanie ogrzewaniem postojowym Webasto, temperaturą docelową i nawiewem (0-4)."""
     climate = VehicleBusinessService.update_climate_settings(db, vehicle_id, payload)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -197,8 +226,9 @@ async def control_central_lock(
     vehicle_id: int,
     payload: LockUpdateRequest,
     db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
 ):
-    """[REST POST / Zarządzanie] Zdalne otwieranie i zamykanie zamka centralnego."""
+    """[JWT: driver/admin] Zdalne otwieranie i zamykanie zamka centralnego."""
     vehicle = VehicleBusinessService.set_central_lock(db, vehicle_id, payload.is_locked)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -214,8 +244,13 @@ async def control_central_lock(
 # ==================== DIAGNOSTYKA OBD-II ====================
 
 @router.get("/{vehicle_id}/obd", response_model=List[ObdErrorResponse], status_code=status.HTTP_200_OK)
-def get_obd_errors(vehicle_id: int, active_only: bool = True, db: Session = Depends(get_db)):
-    """[REST GET] Pobiera listę kodów błędów diagnostycznych OBD-II (404 jeśli pojazd nie istnieje)."""
+def get_obd_errors(
+    vehicle_id: int,
+    active_only: bool = True,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """[JWT: admin/driver/guest] Pobiera listę kodów błędów diagnostycznych OBD-II."""
     VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     query = db.query(ObdError).filter(ObdError.vehicle_id == vehicle_id)
     if active_only:
@@ -228,8 +263,9 @@ async def report_obd_error(
     vehicle_id: int,
     payload: ObdErrorCreateRequest,
     db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
 ):
-    """[REST POST] Rejestruje nowy kod błędu OBD-II zgłoszony przez pojazd/symulator (201 Created)."""
+    """[JWT: driver/admin] Rejestruje nowy kod błędu OBD-II zgłoszony przez pojazd/symulator."""
     err = VehicleBusinessService.register_obd_error(db, vehicle_id, payload)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -248,8 +284,12 @@ async def report_obd_error(
 
 
 @router.delete("/{vehicle_id}/obd", status_code=status.HTTP_200_OK)
-async def clear_obd_errors(vehicle_id: int, db: Session = Depends(get_db)):
-    """[REST DELETE] Kasuje aktywne kody błędów OBD-II w sterowniku pojazdu (400 jeśli pojazd w ruchu)."""
+async def clear_obd_errors(
+    vehicle_id: int,
+    db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
+):
+    """[JWT: driver/admin] Kasuje aktywne kody błędów OBD-II w sterowniku pojazdu (tylko na postoju)."""
     cleared = VehicleBusinessService.clear_obd_errors(db, vehicle_id)
     await ws_manager.broadcast_to_vehicle(
         vehicle_id,
@@ -261,8 +301,12 @@ async def clear_obd_errors(vehicle_id: int, db: Session = Depends(get_db)):
 # ==================== POWIADOMIENIA (NOTIFICATIONS) ====================
 
 @router.get("/{vehicle_id}/notifications", response_model=List[NotificationResponse], status_code=status.HTTP_200_OK)
-def get_notifications(vehicle_id: int, db: Session = Depends(get_db)):
-    """[REST GET] Pobiera historię powiadomień dla pojazdu (404 jeśli pojazd nie istnieje)."""
+def get_notifications(
+    vehicle_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """[JWT: admin/driver/guest] Pobiera historię powiadomień dla pojazdu."""
     VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     return (
         db.query(Notification)
@@ -278,8 +322,13 @@ def get_notifications(vehicle_id: int, db: Session = Depends(get_db)):
     response_model=NotificationResponse,
     status_code=status.HTTP_200_OK,
 )
-def mark_notification_read(vehicle_id: int, notification_id: int, db: Session = Depends(get_db)):
-    """[REST PATCH] Oznacza wskazane powiadomienie jako przeczytane (zwraca 404 jeśli nie istnieje)."""
+def mark_notification_read(
+    vehicle_id: int,
+    notification_id: int,
+    db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
+):
+    """[JWT: driver/admin] Oznacza wskazane powiadomienie jako przeczytane."""
     return VehicleBusinessService.mark_notification_read(db, vehicle_id, notification_id)
 
 
@@ -287,8 +336,13 @@ def mark_notification_read(vehicle_id: int, notification_id: int, db: Session = 
     "/{vehicle_id}/notifications/{notification_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
-def delete_notification(vehicle_id: int, notification_id: int, db: Session = Depends(get_db)):
-    """[REST DELETE] Usuwa powiadomienie (zwraca 204 No Content lub 404 Not Found)."""
+def delete_notification(
+    vehicle_id: int,
+    notification_id: int,
+    db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
+):
+    """[JWT: driver/admin] Usuwa powiadomienie (204 No Content)."""
     VehicleBusinessService.delete_notification(db, vehicle_id, notification_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -296,8 +350,13 @@ def delete_notification(vehicle_id: int, notification_id: int, db: Session = Dep
 # ==================== LOKALIZACJE I TRASY (LOCATIONS & TRIPS) ====================
 
 @router.get("/{vehicle_id}/locations", response_model=List[LocationResponse], status_code=status.HTTP_200_OK)
-def get_location_history(vehicle_id: int, limit: int = 50, db: Session = Depends(get_db)):
-    """[REST GET] Pobiera historię pozycji GPS pojazdu (404 jeśli pojazd nie istnieje)."""
+def get_location_history(
+    vehicle_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """[JWT: admin/driver/guest] Pobiera historię pozycji GPS pojazdu."""
     VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     return (
         db.query(VehicleLocation)
@@ -309,8 +368,12 @@ def get_location_history(vehicle_id: int, limit: int = 50, db: Session = Depends
 
 
 @router.get("/{vehicle_id}/trips", response_model=List[TripResponse], status_code=status.HTTP_200_OK)
-def get_trips(vehicle_id: int, db: Session = Depends(get_db)):
-    """[REST GET] Pobiera listę tras pojazdu (404 jeśli pojazd nie istnieje)."""
+def get_trips(
+    vehicle_id: int,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """[JWT: admin/driver/guest] Pobiera listę tras pojazdu."""
     VehicleBusinessService.get_vehicle_or_404(db, vehicle_id)
     return (
         db.query(Trip)
@@ -321,8 +384,13 @@ def get_trips(vehicle_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{vehicle_id}/trips/start", response_model=TripResponse, status_code=status.HTTP_201_CREATED)
-def start_vehicle_trip(vehicle_id: int, payload: TripStartRequest, db: Session = Depends(get_db)):
-    """[REST POST] Rozpoczyna nową trasę pojazdu (201 Created)."""
+def start_vehicle_trip(
+    vehicle_id: int,
+    payload: TripStartRequest,
+    db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
+):
+    """[JWT: driver/admin] Rozpoczyna nową trasę pojazdu (201 Created)."""
     return VehicleBusinessService.start_trip(db, vehicle_id, payload)
 
 
@@ -332,26 +400,55 @@ def end_vehicle_trip(
     trip_id: int,
     payload: TripEndRequest,
     db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
 ):
-    """[REST POST] Kończy trasę i wylicza Ecodriving (404 jeśli brak trasy, 409 jeśli już zakończona)."""
+    """[JWT: driver/admin] Kończy trasę i wylicza ocenę Ecodrivingu."""
     return VehicleBusinessService.end_trip(db, vehicle_id, trip_id, payload)
 
 
 @router.delete("/{vehicle_id}/trips/{trip_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_vehicle_trip(vehicle_id: int, trip_id: int, db: Session = Depends(get_db)):
-    """[REST DELETE] Usuwa zapisaną trasę (zwraca 204 No Content lub 404 Not Found)."""
+def delete_vehicle_trip(
+    vehicle_id: int,
+    trip_id: int,
+    db: Session = Depends(get_db),
+    _operator: User = Depends(require_driver_or_admin),
+):
+    """[JWT: driver/admin] Usuwa zapisaną trasę (204 No Content)."""
     VehicleBusinessService.delete_trip(db, vehicle_id, trip_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# ==================== WEBSOCKET ====================
+# ==================== WEBSOCKET (CHRONIONY TOKENEM JWT) ====================
 
 @router.websocket("/ws/{vehicle_id}")
-async def vehicle_telemetry_websocket(websocket: WebSocket, vehicle_id: int):
+async def vehicle_telemetry_websocket(
+    websocket: WebSocket,
+    vehicle_id: int,
+    token: Optional[str] = Query(None),
+):
     """
-    Kanał WebSocket do odświeżania Dashboardu w czasie rzeczywistym
-    oraz dwukierunkowej komunikacji z symulatorem pojazdu.
+    [JWT] Kanał WebSocket do odświeżania Dashboardu w czasie rzeczywistym.
+    Wymaga przekazania tokenu JWT jako parametr `?token=<JWT>` lub w nagłówku `Authorization: Bearer <JWT>`.
     """
+    raw_token = token
+    if not raw_token:
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            raw_token = auth_header[7:].strip()
+
+    db = SessionLocal()
+    try:
+        user = get_user_from_token_str(raw_token, db)
+    finally:
+        db.close()
+
+    if not user:
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="Wymagana autoryzacja JWT (?token=<JWT>)",
+        )
+        return
+
     await ws_manager.connect(vehicle_id, websocket)
     try:
         while True:
